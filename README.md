@@ -1,5 +1,8 @@
 # anime-play
 
+[![Build and push Docker image](https://github.com/Shell32-Natsu/anime-play/actions/workflows/docker.yml/badge.svg)](https://github.com/Shell32-Natsu/anime-play/actions/workflows/docker.yml)
+[![GHCR](https://img.shields.io/badge/ghcr.io-shell32--natsu%2Fanime--play-blue?logo=docker)](https://github.com/Shell32-Natsu/anime-play/pkgs/container/anime-play)
+
 把 OpenList 上散乱命名的本地番剧，对外**伪装成一个在线番剧播放站点**：弹幕播放器按它惯常的「在线站点」爬取流程（搜索 → 选条目 → 选集 → 取视频地址）就能播到本地视频，从而给本地番剧挂上弹幕。
 
 本项目是为配合 [Animeko](https://github.com/open-ani/animeko) 使用而写的：在 Animeko 里把本服务添加为一个自定义（Selector）数据源，即可在 Animeko 中直接搜到、播放 OpenList 上的本地番剧并自动挂载弹幕。其他支持「自定义网页源 + CSS/XPath 选择器」的播放器同样适用。
@@ -13,69 +16,75 @@
 
 ---
 
-## 镜像（GHCR）
+## 快速开始（直接用 GHCR 镜像，推荐）
 
-仓库自带 GitHub Actions 工作流（`.github/workflows/docker.yml`）：push 到 `main` 或打 `v*` 标签时，自动跑测试、构建多架构镜像（linux/amd64 + linux/arm64）并推送到 GHCR：
+镜像已发布在 GHCR（linux/amd64 + linux/arm64），不需要 clone 仓库。新建一个目录，放两个文件：
 
-- `ghcr.io/shell32-natsu/anime-play:latest` —— main 分支最新
-- `ghcr.io/shell32-natsu/anime-play:main-<sha>` —— 按 commit 固定版本
-- `ghcr.io/shell32-natsu/anime-play:1.2.3` / `1.2` —— 打 `v1.2.3` 标签时生成
-
-不想本地构建的话，把 `docker-compose.yml` 里的 `build: .` 换成（或直接保留 `image:` 行并删掉 `build:`）：
+`docker-compose.yml`：
 
 ```yaml
+services:
+  anime-play:
     image: ghcr.io/shell32-natsu/anime-play:latest
+    container_name: anime-play
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/data        # 映射文件持久化目录
+    env_file:
+      - .env
 ```
 
-Pull request 只跑测试与构建验证，不推送镜像。推送使用内置的 `GITHUB_TOKEN`，无需配置额外 secret；首次发布后如需公开拉取，到 GitHub Packages 页面把该 package 的可见性改为 public。
-
-## 快速开始（Docker Compose，推荐）
-
-1. 准备配置文件（compose 通过 `env_file` 把 `.env` 注入容器，`.env` 已在 .gitignore 里，不会被提交）：
+`.env`（完整可选项见 [.env.example](.env.example)）：
 
 ```bash
-cp .env.example .env
-# 编辑 .env，填上 OPENLIST_BASE_URL / OPENLIST_TOKEN / SCAN_ROOTS，其余可保持默认
+OPENLIST_BASE_URL=http://192.168.1.10:5244
+OPENLIST_TOKEN=alist-xxxxxxxxxxxxxxxx
+SCAN_ROOTS=/anime,/anime2
+# 建议设置，保护 /admin 管理页
+ADMIN_TOKEN=change-me
 ```
 
-2. 启动：
+启动 / 停止：
 
 ```bash
-docker compose up -d --build     # 首次或代码更新后（构建镜像并后台启动）
-docker compose logs -f           # 查看运行日志（确认扫描到的条目数）
-```
-
-3. 停止 / 重启 / 卸载：
-
-```bash
+docker compose up -d             # 启动（修改 .env 后也用它重建容器生效）
+docker compose logs -f           # 查看日志（确认扫描到的条目数）
+docker compose pull && docker compose up -d   # 升级到最新镜像
 docker compose stop              # 停止容器（保留容器与数据）
-docker compose start             # 再次启动
-docker compose up -d             # 修改 .env 后用 up -d 重建容器使新配置生效
-docker compose down              # 停止并删除容器（./data 下的 mapping.json 不会丢）
+docker compose down              # 停止并删除容器（./data 下的映射文件不会丢）
 ```
 
-映射文件持久化在 `./data/mapping.json`（compose 中挂载到容器内 `/data`），删除容器、升级镜像都不影响已配置的映射。
-
-### 不用 Compose 的 docker run 方式
+不用 Compose 的话，等价的 `docker run`：
 
 ```bash
-docker build -t anime-play .
-
 docker run -d --name anime-play \
   -p 8080:8080 \
   -v ./data:/data \
   -e OPENLIST_BASE_URL=http://192.168.1.10:5244 \
   -e OPENLIST_TOKEN=alist-xxxxxxxxxxxxxxxx \
-  -e SCAN_ROOTS=/anime,/anime2,/盘B/番剧 \
-  anime-play
-
-# 停止 / 启动 / 删除
-docker stop anime-play
-docker start anime-play
-docker rm -f anime-play
+  -e SCAN_ROOTS=/anime,/anime2 \
+  ghcr.io/shell32-natsu/anime-play:latest
 ```
 
-启动后：
+### 从源码部署
+
+```bash
+git clone https://github.com/Shell32-Natsu/anime-play.git && cd anime-play
+cp .env.example .env             # 编辑 .env，填上必填三项
+docker compose up -d --build     # 仓库自带的 compose 用 build: . 本地构建
+```
+
+### 镜像 tag 说明
+
+GitHub Actions（`.github/workflows/docker.yml`）在 push 到 `main` 或打 `v*` 标签时自动跑测试、构建多架构镜像并推送：
+
+- `ghcr.io/shell32-natsu/anime-play:latest` —— main 分支最新
+- `ghcr.io/shell32-natsu/anime-play:main-<sha>` —— 按 commit 固定版本
+- `ghcr.io/shell32-natsu/anime-play:1.2.3` / `1.2` —— 打 `v1.2.3` 标签时生成
+
+### 启动后的初始配置
 
 1. 打开 `http://<host>:8080/admin`，确认条目已扫出（新增番剧后可点「手动刷新索引」或访问 `/refresh`）
 2. 在 `/admin` 给每个条目填上番剧名和别名（中文名 / 日文名 / 罗马音 / 简称，逗号分隔），保存即生效

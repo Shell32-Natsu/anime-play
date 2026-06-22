@@ -8,12 +8,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/donnyxia/anime-play/internal/epmap"
 	"github.com/donnyxia/anime-play/internal/index"
 	"github.com/donnyxia/anime-play/internal/mapping"
 	"github.com/donnyxia/anime-play/internal/openlist"
@@ -76,10 +78,11 @@ func file(name string) openlist.Item { return openlist.Item{Name: name, Size: 1 
 func dir(name string) openlist.Item  { return openlist.Item{Name: name, IsDir: true} }
 
 func newTestServer(t *testing.T) (*httptest.Server, *fakeOpenList, *mapping.Store) {
-	return newTestServerWithToken(t, "")
+	srv, fake, store, _ := newTestServerWithToken(t, "")
+	return srv, fake, store
 }
 
-func newTestServerWithToken(t *testing.T, adminToken string) (*httptest.Server, *fakeOpenList, *mapping.Store) {
+func newTestServerWithToken(t *testing.T, adminToken string) (*httptest.Server, *fakeOpenList, *mapping.Store, *epmap.Store) {
 	t.Helper()
 	fake := &fakeOpenList{
 		t: t,
@@ -109,8 +112,14 @@ func newTestServerWithToken(t *testing.T, adminToken string) (*httptest.Server, 
 	upstream := httptest.NewServer(fake.handler())
 	t.Cleanup(upstream.Close)
 
+	epStore, err := epmap.NewStore(filepath.Join(t.TempDir(), "episodes.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(epStore.Close)
+
 	client := openlist.New(upstream.URL, "test-token")
-	idx := index.New(client, []string{"/anime", "/anime2"}, time.Hour)
+	idx := index.New(client, []string{"/anime", "/anime2"}, time.Hour, epStore)
 	if err := idx.Scan(context.Background()); err != nil {
 		t.Fatalf("扫描失败: %v", err)
 	}
@@ -121,9 +130,9 @@ func newTestServerWithToken(t *testing.T, adminToken string) (*httptest.Server, 
 	}
 	t.Cleanup(store.Close)
 
-	srv := httptest.NewServer(New(idx, store, adminToken).Handler())
+	srv := httptest.NewServer(New(idx, store, epStore, adminToken).Handler())
 	t.Cleanup(srv.Close)
-	return srv, fake, store
+	return srv, fake, store, epStore
 }
 
 func get(t *testing.T, rawURL string) (int, string) {
@@ -314,7 +323,7 @@ func TestAdminSaveRejectsUnknownDir(t *testing.T) {
 }
 
 func TestAdminTokenAuth(t *testing.T) {
-	srv, _, _ := newTestServerWithToken(t, "secret-token")
+	srv, _, _, _ := newTestServerWithToken(t, "secret-token")
 
 	// 对外端点不受影响
 	if code, _ := get(t, srv.URL+"/search?keyword="); code != 200 {
@@ -357,6 +366,164 @@ func TestAdminTokenAuth(t *testing.T) {
 	if res.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("错误口令应 401，实际 %d", res.StatusCode)
 	}
+}
+
+func TestManualEpisodeOverrides(t *testing.T) {
+	fake := &fakeOpenList{
+		t: t,
+		tree: map[string][]openlist.Item{
+			"/anime": {dir("Bocchi")},
+			"/anime/Bocchi": {
+				file("Bocchi - 01.mkv"),
+				file("Bocchi - 02.mkv"),
+				file("ED-MV.mp4"), // 自动解析不出集数
+			},
+		},
+	}
+	upstream := httptest.NewServer(fake.handler())
+	t.Cleanup(upstream.Close)
+
+	// 手动集数映射：把 ED-MV.mp4 指定为第 13 话，并把 02 覆盖成第 5 话
+	yamlPath := filepath.Join(t.TempDir(), "episodes.yaml")
+	content := "entries:\n  - dir: /anime/Bocchi\n    episodes:\n      13: ED-MV.mp4\n      5: Bocchi - 02.mkv\n"
+	if err := os.WriteFile(yamlPath, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	epStore, err := epmap.NewStore(yamlPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(epStore.Close)
+
+	client := openlist.New(upstream.URL, "test-token")
+	idx := index.New(client, []string{"/anime"}, time.Hour, epStore)
+	if err := idx.Scan(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := mapping.NewStore(filepath.Join(t.TempDir(), "mapping.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(store.Close)
+	srv := httptest.NewServer(New(idx, store, epStore, "").Handler())
+	t.Cleanup(srv.Close)
+
+	_, body := get(t, srv.URL+"/play?id=/anime/Bocchi")
+	for _, want := range []string{">第 1 话</a>", ">第 5 话</a>", ">第 13 话</a>"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("播放页缺少 %q（手动集数映射未生效）:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, ">第 2 话</a>") || strings.Contains(body, "ED-MV.mp4</a>") {
+		t.Fatalf("手动映射应覆盖自动解析结果:\n%s", body)
+	}
+	// 顺序应为 1、5、13：ep=3 应对应 ED-MV（第 13 话）
+	listCalls := fake.listHits.Load()
+
+	// 修改 YAML 后 ApplyOverrides：纯内存重建，不应产生新的 fs/list
+	if err := epStore.Watch(idx.ApplyOverrides); err != nil {
+		t.Fatal(err)
+	}
+	content = "entries:\n  - dir: /anime/Bocchi\n    episodes:\n      99: ED-MV.mp4\n"
+	if err := os.WriteFile(yamlPath, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool {
+		_, b := get(t, srv.URL+"/play?id=/anime/Bocchi")
+		return strings.Contains(b, ">第 99 话</a>") && strings.Contains(b, ">第 2 话</a>")
+	})
+	if fake.listHits.Load() != listCalls {
+		t.Fatalf("应用手动集数映射不应重新请求 OpenList（fs/list %d -> %d）", listCalls, fake.listHits.Load())
+	}
+}
+
+func TestAdminEpisodesPageAndSave(t *testing.T) {
+	srv, _, _, epStore := newTestServerWithToken(t, "")
+
+	bocchiID := "/anime/[Lilith-Raws] Bocchi the Rock! [Baha][1080p]"
+	epPage := "/admin/episodes?id=" + url.QueryEscape(bocchiID)
+
+	// 编辑页：列出文件名、自动解析结果与输入框
+	code, body := get(t, srv.URL+epPage)
+	if code != 200 {
+		t.Fatalf("admin/episodes code = %d", code)
+	}
+	for _, want := range []string{"SP Menu.mp4", `class="ep-num"`, "第 1 话", "第 2 话", "保存全部"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("集数编辑页缺少 %q:\n%s", want, body)
+		}
+	}
+
+	// 保存：把 SP Menu.mp4 手动指定为第 13 话
+	doSave := func(payload string, wantCode int) string {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodPost, srv.URL+"/admin/episodes/save", strings.NewReader(payload))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Requested-With", "anime-play")
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer res.Body.Close()
+		b, _ := io.ReadAll(res.Body)
+		if res.StatusCode != wantCode {
+			t.Fatalf("episodes/save code = %d（期望 %d）: %s", res.StatusCode, wantCode, b)
+		}
+		return string(b)
+	}
+
+	doSave(`{"dir":"`+bocchiID+`","episodes":{"[Lilith-Raws] Bocchi the Rock! - SP Menu.mp4":"13"}}`, 200)
+
+	// 内存与磁盘都生效
+	if ov := epStore.Overrides(bocchiID); ov["[Lilith-Raws] Bocchi the Rock! - SP Menu.mp4"] != 13 {
+		t.Fatalf("保存后 Overrides = %v", ov)
+	}
+	// 播放页立刻生效（无需 /refresh）
+	_, body = get(t, srv.URL+"/play?id="+url.QueryEscape(bocchiID))
+	if !strings.Contains(body, ">第 13 话</a>") || strings.Contains(body, "SP Menu.mp4</a>") {
+		t.Fatalf("保存集数后播放页未立刻生效:\n%s", body)
+	}
+	// 编辑页显示当前手动值
+	_, body = get(t, srv.URL+epPage)
+	if !strings.Contains(body, `value="13"`) {
+		t.Fatalf("编辑页未显示已保存的手动集数:\n%s", body)
+	}
+
+	// 非法请求：不在该条目中的文件 / 非数字 / 重复集数 / 缺 CSRF 头
+	doSave(`{"dir":"`+bocchiID+`","episodes":{"nope.mkv":"1"}}`, http.StatusBadRequest)
+	doSave(`{"dir":"`+bocchiID+`","episodes":{"[Lilith-Raws] Bocchi the Rock! - SP Menu.mp4":"abc"}}`, http.StatusBadRequest)
+	doSave(`{"dir":"`+bocchiID+`","episodes":{"[Lilith-Raws] Bocchi the Rock! - 01 [Baha][WEB-DL][1080p][AVC AAC][CHT][MP4].mp4":"1","[Lilith-Raws] Bocchi the Rock! - 02 [Baha][WEB-DL][1080p][AVC AAC][CHT][MP4].mp4":"1"}}`, http.StatusBadRequest)
+	res, err := http.Post(srv.URL+"/admin/episodes/save", "application/json", strings.NewReader(`{"dir":"`+bocchiID+`","episodes":{}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusForbidden {
+		t.Fatalf("缺少 CSRF 防护头时应返回 403，实际 %d", res.StatusCode)
+	}
+
+	// 清空：全部留空 = 删除该条目的手动映射
+	doSave(`{"dir":"`+bocchiID+`","episodes":{}}`, 200)
+	if ov := epStore.Overrides(bocchiID); ov != nil {
+		t.Fatalf("清空后 Overrides 应为 nil: %v", ov)
+	}
+	_, body = get(t, srv.URL+"/play?id="+url.QueryEscape(bocchiID))
+	if !strings.Contains(body, "SP Menu.mp4</a>") {
+		t.Fatalf("清空手动映射后应回到自动解析:\n%s", body)
+	}
+}
+
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("等待条件超时")
 }
 
 func TestRefreshEndpoint(t *testing.T) {

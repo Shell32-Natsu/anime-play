@@ -1,0 +1,23 @@
+# 手动集数映射（可选）
+#
+# 用途：某些条目文件名太乱、自动解析不出集数或解析错误时，在这里手动指定「集数 → 文件名」。
+# 使用：复制本文件到映射 volume 内（默认路径 /data/episodes.yaml，即 ./data/episodes.yaml），
+#       按需填写后保存即可——服务会自动热重载并在内存里重建集数列表，无需重启、不会重新请求 OpenList。
+#
+# 规则：
+#   - dir 是条目对应的 OpenList 完整路径（与 /admin 列表、mapping.json 中的 dir 一致）
+#   - episodes 的键是集数（支持小数，如 12.5），值是该条目文件夹下的【视频文件名】（不含路径）
+#   - 手动指定的文件优先于文件名自动解析；未列出的文件仍走自动解析
+#   - 指定的文件名必须真实存在于该文件夹中，否则该条映射不生效
+
+entries:
+  - dir: /anime/[Lilith-Raws] Bocchi the Rock! [Baha][1080p]
+    episodes:
+      1: "[Lilith-Raws] Bocchi the Rock! - 01 [Baha][WEB-DL][1080p][AVC AAC][CHT][MP4].mp4"
+      12: "Bocchi Final (BDrip).mkv"
+      12.5: "特典映像.mkv"
+
+  # - dir: /盘B/番剧/某个乱命名的番
+  #   episodes:
+  #     1: "DISC1_title_t00.mkv"
+  #     2: "DISC1_title_t01.mkv"

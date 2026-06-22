@@ -49,12 +49,28 @@ type Entry struct {
 	Episodes []Episode
 }
 
+// EpisodeOverrides 提供手动集数映射：返回某条目目录下「文件名 → 手动指定集数」。
+// 没有配置时返回 nil。由 epmap.Store 实现。
+type EpisodeOverrides interface {
+	Overrides(dir string) map[string]float64
+}
+
+// rawEntry 一次扫描得到的原始数据（只有目录与视频文件名），
+// 保留它是为了在手动集数映射变更时无需重新请求 OpenList 即可重建条目。
+type rawEntry struct {
+	root   string
+	dir    string
+	videos []string
+}
+
 // Index 内存条目索引。
 type Index struct {
-	client *openlist.Client
-	roots  []string
+	client    *openlist.Client
+	roots     []string
+	overrides EpisodeOverrides // 可为 nil
 
 	mu        sync.RWMutex
+	raw       []rawEntry
 	entries   []*Entry
 	byID      map[string]*Entry
 	lastScan  time.Time
@@ -72,11 +88,12 @@ type cachedURL struct {
 	expires time.Time
 }
 
-// New 创建索引。
-func New(client *openlist.Client, roots []string, rawURLTTL time.Duration) *Index {
+// New 创建索引。overrides 可为 nil（不使用手动集数映射）。
+func New(client *openlist.Client, roots []string, rawURLTTL time.Duration, overrides EpisodeOverrides) *Index {
 	return &Index{
 		client:    client,
 		roots:     roots,
+		overrides: overrides,
 		byID:      map[string]*Entry{},
 		rawURLTTL: rawURLTTL,
 		urlCache:  map[string]cachedURL{},
@@ -90,45 +107,69 @@ func (ix *Index) Scan(ctx context.Context) error {
 	defer ix.scanMu.Unlock()
 
 	start := time.Now()
-	var entries []*Entry
+	var raw []rawEntry
 	var errs []string
 
 	for _, root := range ix.roots {
-		rootEntries, err := ix.scanDir(ctx, root, root, 0)
+		rootRaw, err := ix.scanDir(ctx, root, root, 0)
 		if err != nil {
 			log.Printf("[index] 扫描根 %s 失败: %v", root, err)
 			errs = append(errs, fmt.Sprintf("%s: %v", root, err))
 			continue
 		}
-		entries = append(entries, rootEntries...)
+		raw = append(raw, rootRaw...)
 	}
 
-	sort.Slice(entries, func(i, j int) bool { return entries[i].ID < entries[j].ID })
-	byID := make(map[string]*Entry, len(entries))
-	for _, e := range entries {
-		byID[e.ID] = e
-	}
+	sort.Slice(raw, func(i, j int) bool { return raw[i].dir < raw[j].dir })
 
 	ix.mu.Lock()
-	ix.entries = entries
-	ix.byID = byID
+	ix.raw = raw
+	ix.rebuildLocked()
 	ix.lastScan = time.Now()
 	if len(errs) > 0 {
 		ix.scanError = fmt.Errorf("%s", strings.Join(errs, "; "))
 	} else {
 		ix.scanError = nil
 	}
+	count := len(ix.entries)
 	ix.mu.Unlock()
 
-	log.Printf("[index] 扫描完成：%d 个条目，耗时 %s", len(entries), time.Since(start).Round(time.Millisecond))
+	log.Printf("[index] 扫描完成：%d 个条目，耗时 %s", count, time.Since(start).Round(time.Millisecond))
 	if len(errs) > 0 {
 		return fmt.Errorf("部分根扫描失败: %s", strings.Join(errs, "; "))
 	}
 	return nil
 }
 
+// rebuildLocked 用最近一次扫描的原始数据 + 当前手动集数映射重建条目列表。
+// 调用方需持有 ix.mu 写锁。
+func (ix *Index) rebuildLocked() {
+	entries := make([]*Entry, 0, len(ix.raw))
+	byID := make(map[string]*Entry, len(ix.raw))
+	for _, r := range ix.raw {
+		var ov map[string]float64
+		if ix.overrides != nil {
+			ov = ix.overrides.Overrides(r.dir)
+		}
+		e := buildEntry(r.root, r.dir, r.videos, ov)
+		entries = append(entries, e)
+		byID[e.ID] = e
+	}
+	ix.entries = entries
+	ix.byID = byID
+}
+
+// ApplyOverrides 在手动集数映射变更后重建条目（纯内存操作，不请求 OpenList）。
+func (ix *Index) ApplyOverrides() {
+	ix.mu.Lock()
+	ix.rebuildLocked()
+	count := len(ix.entries)
+	ix.mu.Unlock()
+	log.Printf("[index] 手动集数映射已应用，重建 %d 个条目", count)
+}
+
 // scanDir 递归扫描；某个文件夹直接含视频文件则作为一个条目，同时继续向下找嵌套条目。
-func (ix *Index) scanDir(ctx context.Context, root, dir string, depth int) ([]*Entry, error) {
+func (ix *Index) scanDir(ctx context.Context, root, dir string, depth int) ([]rawEntry, error) {
 	if depth > maxScanDepth {
 		log.Printf("[index] 超过最大深度 %d，跳过 %s", maxScanDepth, dir)
 		return nil, nil
@@ -143,31 +184,32 @@ func (ix *Index) scanDir(ctx context.Context, root, dir string, depth int) ([]*E
 		return nil, nil
 	}
 
-	var videos []openlist.Item
-	var subdirs []openlist.Item
+	var videos []string
+	var subdirs []string
 	for _, it := range items {
 		if it.IsDir {
-			subdirs = append(subdirs, it)
+			subdirs = append(subdirs, it.Name)
 		} else if episode.IsVideo(it.Name) {
-			videos = append(videos, it)
+			videos = append(videos, it.Name)
 		}
 	}
 
-	var entries []*Entry
+	var raw []rawEntry
 	if len(videos) > 0 {
-		entries = append(entries, buildEntry(root, dir, videos))
+		raw = append(raw, rawEntry{root: root, dir: dir, videos: videos})
 	}
 	for _, sd := range subdirs {
-		child, err := ix.scanDir(ctx, root, joinPath(dir, sd.Name), depth+1)
+		child, err := ix.scanDir(ctx, root, joinPath(dir, sd), depth+1)
 		if err != nil {
 			return nil, err
 		}
-		entries = append(entries, child...)
+		raw = append(raw, child...)
 	}
-	return entries, nil
+	return raw, nil
 }
 
-func buildEntry(root, dir string, videos []openlist.Item) *Entry {
+// buildEntry 由目录与视频文件名构建条目；overrides（文件名 → 集数）优先于文件名自动解析。
+func buildEntry(root, dir string, videos []string, overrides map[string]float64) *Entry {
 	dirName := dir
 	parent := ""
 	if i := strings.LastIndex(dir, "/"); i >= 0 {
@@ -192,18 +234,22 @@ func buildEntry(root, dir string, videos []openlist.Item) *Entry {
 		DirName:     dirName,
 		CleanedName: cleaned,
 	}
-	for _, v := range videos {
-		num, ok := episode.Parse(v.Name)
+	for _, name := range videos {
+		num, ok := episode.Parse(name)
+		// 手动集数映射优先于文件名自动解析
+		if manual, has := overrides[name]; has {
+			num, ok = manual, true
+		}
 		ep := Episode{
-			FileName:  v.Name,
-			Path:      joinPath(dir, v.Name),
+			FileName:  name,
+			Path:      joinPath(dir, name),
 			Number:    num,
 			HasNumber: ok,
 		}
 		if ok {
 			ep.Title = episode.FormatEpisodeNumber(num)
 		} else {
-			ep.Title = v.Name
+			ep.Title = name
 		}
 		e.Episodes = append(e.Episodes, ep)
 	}

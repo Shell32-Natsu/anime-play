@@ -20,7 +20,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/fsnotify/fsnotify"
+	"github.com/donnyxia/anime-play/internal/fswatch"
 )
 
 // Entry 映射文件中的一条记录。
@@ -42,17 +42,14 @@ type Store struct {
 	mu    sync.RWMutex
 	byDir map[string][]string
 
-	watcher  *fsnotify.Watcher
-	stopOnce sync.Once
-	stopCh   chan struct{}
+	stopWatch func()
 }
 
 // NewStore 创建 Store 并尝试加载已有映射文件；文件不存在时以空映射启动。
 func NewStore(path string) (*Store, error) {
 	s := &Store{
-		path:   path,
-		byDir:  map[string][]string{},
-		stopCh: make(chan struct{}),
+		path:  path,
+		byDir: map[string][]string{},
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, fmt.Errorf("创建映射文件目录失败: %w", err)
@@ -166,81 +163,28 @@ func (s *Store) writeFile(entries []Entry) error {
 	return nil
 }
 
-// Watch 启动 fsnotify 监听（监听文件所在目录），外部修改映射文件后自动热重载。
+// Watch 启动 fsnotify 监听（监听文件所在目录 + 防抖），外部修改映射文件后自动热重载。
 func (s *Store) Watch() error {
-	w, err := fsnotify.NewWatcher()
+	stop, err := fswatch.WatchFile(s.path, 200*time.Millisecond, func() {
+		// 失败保护：重读失败时保留旧映射，等待下次有效变更
+		if err := s.reload(); err != nil {
+			log.Printf("[mapping] 热重载失败: %v", err)
+		}
+	})
 	if err != nil {
-		return fmt.Errorf("创建 fsnotify watcher 失败: %w", err)
+		return err
 	}
-	dir := filepath.Dir(s.path)
-	if err := w.Add(dir); err != nil {
-		w.Close()
-		return fmt.Errorf("监听目录 %s 失败: %w", dir, err)
-	}
-	s.watcher = w
-
-	go s.watchLoop()
+	s.stopWatch = stop
 	log.Printf("[mapping] 正在监听 %s 的变更（热重载）", s.path)
 	return nil
 }
 
-const debounceWindow = 200 * time.Millisecond
-
-func (s *Store) watchLoop() {
-	target := filepath.Base(s.path)
-	var timer *time.Timer
-	var timerC <-chan time.Time
-
-	for {
-		select {
-		case <-s.stopCh:
-			return
-		case event, ok := <-s.watcher.Events:
-			if !ok {
-				return
-			}
-			if filepath.Base(event.Name) != target {
-				continue
-			}
-			if event.Op&(fsnotify.Create|fsnotify.Write|fsnotify.Rename|fsnotify.Remove) == 0 {
-				continue
-			}
-			// 防抖：~200ms 内的连续事件合并为一次重读
-			if timer == nil {
-				timer = time.NewTimer(debounceWindow)
-			} else {
-				if !timer.Stop() {
-					select {
-					case <-timer.C:
-					default:
-					}
-				}
-				timer.Reset(debounceWindow)
-			}
-			timerC = timer.C
-		case <-timerC:
-			timerC = nil
-			if err := s.reload(); err != nil {
-				// 失败保护：保留旧映射，等待下次有效变更
-				log.Printf("[mapping] 热重载失败: %v", err)
-			}
-		case err, ok := <-s.watcher.Errors:
-			if !ok {
-				return
-			}
-			log.Printf("[mapping] fsnotify 错误: %v", err)
-		}
-	}
-}
-
 // Close 停止监听。
 func (s *Store) Close() {
-	s.stopOnce.Do(func() {
-		close(s.stopCh)
-		if s.watcher != nil {
-			s.watcher.Close()
-		}
-	})
+	if s.stopWatch != nil {
+		s.stopWatch()
+		s.stopWatch = nil
+	}
 }
 
 func normalizeNames(names []string) []string {

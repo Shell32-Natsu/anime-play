@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/donnyxia/anime-play/internal/config"
+	"github.com/donnyxia/anime-play/internal/epmap"
 	"github.com/donnyxia/anime-play/internal/index"
 	"github.com/donnyxia/anime-play/internal/mapping"
 	"github.com/donnyxia/anime-play/internal/openlist"
@@ -42,9 +43,21 @@ func main() {
 		log.Fatalf("启动映射文件监听失败: %v", err)
 	}
 
+	// 手动集数映射（YAML，可选）：加载 + 热重载
+	epStore, err := epmap.NewStore(cfg.EpisodeMapFile)
+	if err != nil {
+		log.Fatalf("加载集数映射文件失败: %v", err)
+	}
+	defer epStore.Close()
+
 	// 条目索引：启动时扫描一次（失败不退出，可稍后 /refresh），并按间隔自动刷新
 	client := openlist.New(cfg.OpenListBaseURL, cfg.OpenListToken)
-	idx := index.New(client, cfg.ScanRoots, cfg.RawURLCacheTTL)
+	idx := index.New(client, cfg.ScanRoots, cfg.RawURLCacheTTL, epStore)
+
+	// 集数映射文件变更后只在内存里重建条目，不重新请求 OpenList
+	if err := epStore.Watch(idx.ApplyOverrides); err != nil {
+		log.Fatalf("启动集数映射文件监听失败: %v", err)
+	}
 
 	scanCtx, cancelScan := context.WithTimeout(ctx, 10*time.Minute)
 	if err := idx.Scan(scanCtx); err != nil {
@@ -59,7 +72,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              ":" + cfg.ListenPort,
-		Handler:           server.New(idx, store, cfg.AdminToken).Handler(),
+		Handler:           server.New(idx, store, epStore, cfg.AdminToken).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 

@@ -20,6 +20,8 @@ type Config struct {
 	ListenPort string
 	// MappingFile 番剧名映射文件路径（应位于挂载 volume 内）
 	MappingFile string
+	// AdminToken 可选的 /admin 管理页访问口令；为空时 /admin 不做鉴权（仅建议在可信内网使用）
+	AdminToken string
 	// RefreshInterval 目录索引自动刷新间隔
 	RefreshInterval time.Duration
 	// RawURLCacheTTL 视频直链缓存 TTL，应保守地小于 OpenList 签名有效期
@@ -47,6 +49,7 @@ func FromEnv() (*Config, error) {
 		OpenListToken:   os.Getenv("OPENLIST_TOKEN"),
 		ListenPort:      envDefault("LISTEN_PORT", "8080"),
 		MappingFile:     envDefault("MAPPING_FILE", "/data/mapping.json"),
+		AdminToken:      os.Getenv("ADMIN_TOKEN"),
 	}
 
 	if cfg.OpenListBaseURL == "" {

@@ -12,6 +12,7 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -29,21 +30,47 @@ import (
 
 // Server HTTP 服务。
 type Server struct {
-	idx     *index.Index
-	mapping *mapping.Store
-	mux     *http.ServeMux
+	idx        *index.Index
+	mapping    *mapping.Store
+	adminToken string
+	mux        *http.ServeMux
 }
 
-// New 创建 Server。
-func New(idx *index.Index, m *mapping.Store) *Server {
-	s := &Server{idx: idx, mapping: m, mux: http.NewServeMux()}
+// New 创建 Server。adminToken 非空时，/admin、/admin/save、/refresh 这些管理端点
+// 需要鉴权（HTTP Basic 的密码 = token，或请求头 X-Admin-Token）；为空则不鉴权，
+// 仅适合可信内网。对外伪站点端点（/search /play）始终无鉴权，供播放器爬取。
+func New(idx *index.Index, m *mapping.Store, adminToken string) *Server {
+	s := &Server{idx: idx, mapping: m, adminToken: adminToken, mux: http.NewServeMux()}
 	s.mux.HandleFunc("GET /search", s.handleSearch)
 	s.mux.HandleFunc("GET /play", s.handlePlay)
-	s.mux.HandleFunc("GET /refresh", s.handleRefresh)
-	s.mux.HandleFunc("GET /admin", s.handleAdmin)
-	s.mux.HandleFunc("POST /admin/save", s.handleAdminSave)
+	s.mux.HandleFunc("GET /refresh", s.requireAdmin(s.handleRefresh))
+	s.mux.HandleFunc("GET /admin", s.requireAdmin(s.handleAdmin))
+	s.mux.HandleFunc("POST /admin/save", s.requireAdmin(s.handleAdminSave))
 	s.mux.HandleFunc("GET /", s.handleRoot)
 	return s
+}
+
+// requireAdmin 管理端点鉴权中间件；adminToken 为空时直接放行。
+func (s *Server) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.adminToken == "" {
+			next(w, r)
+			return
+		}
+		equal := func(got string) bool {
+			return subtle.ConstantTimeCompare([]byte(got), []byte(s.adminToken)) == 1
+		}
+		if equal(r.Header.Get("X-Admin-Token")) {
+			next(w, r)
+			return
+		}
+		if _, pass, ok := r.BasicAuth(); ok && equal(pass) {
+			next(w, r)
+			return
+		}
+		w.Header().Set("WWW-Authenticate", `Basic realm="anime-play admin"`)
+		http.Error(w, "需要管理口令（Basic 密码或 X-Admin-Token 请求头 = ADMIN_TOKEN）", http.StatusUnauthorized)
+	}
 }
 
 // Handler 返回 http.Handler。
@@ -261,6 +288,19 @@ type adminSaveRequest struct {
 }
 
 func (s *Server) handleAdminSave(w http.ResponseWriter, r *http.Request) {
+	// CSRF 防护：要求自定义请求头 + JSON Content-Type。
+	// 跨站表单（form / text-plain enctype）无法携带自定义头；浏览器里带自定义头的
+	// 跨域 fetch 会先发 CORS 预检，本服务不返回任何 CORS 允许头，预检即失败。
+	// /admin 页面内的 fetch 会带上该头（见 adminTmpl 中的脚本）。
+	if r.Header.Get("X-Requested-With") != "anime-play" {
+		http.Error(w, "缺少 X-Requested-With 请求头（直接调用 API 时请加上 X-Requested-With: anime-play）", http.StatusForbidden)
+		return
+	}
+	if ct := r.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		http.Error(w, "Content-Type 必须为 application/json", http.StatusUnsupportedMediaType)
+		return
+	}
+
 	var req adminSaveRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		http.Error(w, "请求体不是有效 JSON: "+err.Error(), http.StatusBadRequest)
@@ -268,6 +308,11 @@ func (s *Server) handleAdminSave(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Dir == "" {
 		http.Error(w, "dir 不能为空", http.StatusBadRequest)
+		return
+	}
+	// 只允许给当前索引中存在的条目写映射，拒绝任意字符串注入映射文件
+	if _, ok := s.idx.Get(req.Dir); !ok {
+		http.Error(w, "dir 不是当前索引中的条目（新增番剧请先 /refresh）", http.StatusBadRequest)
 		return
 	}
 	if err := s.mapping.SetNames(req.Dir, req.Names); err != nil {
@@ -410,7 +455,7 @@ document.addEventListener('click', async (ev) => {
   try {
     const res = await fetch('/admin/save', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'anime-play' },
       body: JSON.stringify({ dir: input.dataset.dir, names })
     });
     if (!res.ok) throw new Error(await res.text());

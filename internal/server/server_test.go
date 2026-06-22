@@ -76,6 +76,10 @@ func file(name string) openlist.Item { return openlist.Item{Name: name, Size: 1 
 func dir(name string) openlist.Item  { return openlist.Item{Name: name, IsDir: true} }
 
 func newTestServer(t *testing.T) (*httptest.Server, *fakeOpenList, *mapping.Store) {
+	return newTestServerWithToken(t, "")
+}
+
+func newTestServerWithToken(t *testing.T, adminToken string) (*httptest.Server, *fakeOpenList, *mapping.Store) {
 	t.Helper()
 	fake := &fakeOpenList{
 		t: t,
@@ -117,7 +121,7 @@ func newTestServer(t *testing.T) (*httptest.Server, *fakeOpenList, *mapping.Stor
 	}
 	t.Cleanup(store.Close)
 
-	srv := httptest.NewServer(New(idx, store).Handler())
+	srv := httptest.NewServer(New(idx, store, adminToken).Handler())
 	t.Cleanup(srv.Close)
 	return srv, fake, store
 }
@@ -252,9 +256,25 @@ func TestAdminPageAndSave(t *testing.T) {
 		}
 	}
 
-	// 通过 /admin/save 写映射
+	// 缺少 X-Requested-With 头（模拟跨站表单 CSRF）：应被拒绝
 	payload := `{"dir":"/anime2/K-ON!","names":["轻音少女","K-ON!"]}`
 	res, err := http.Post(srv.URL+"/admin/save", "application/json", strings.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusForbidden {
+		t.Fatalf("缺少 CSRF 防护头时应返回 403，实际 %d", res.StatusCode)
+	}
+	if names := store.NamesFor("/anime2/K-ON!"); names != nil {
+		t.Fatalf("被拒绝的请求不应写入映射: %v", names)
+	}
+
+	// 带上 /admin 页面 fetch 使用的请求头：保存成功
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/admin/save", strings.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Requested-With", "anime-play")
+	res, err = http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -270,6 +290,72 @@ func TestAdminPageAndSave(t *testing.T) {
 	_, body = get(t, srv.URL+"/search?keyword=轻音")
 	if !strings.Contains(body, `<span class="anime-title">轻音少女</span>`) {
 		t.Fatalf("保存映射后搜索未命中:\n%s", body)
+	}
+}
+
+func TestAdminSaveRejectsUnknownDir(t *testing.T) {
+	srv, _, store := newTestServer(t)
+
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/admin/save",
+		strings.NewReader(`{"dir":"/not/in/index","names":["x"]}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Requested-With", "anime-play")
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("索引外的 dir 应被拒绝，实际 %d", res.StatusCode)
+	}
+	if store.NamesFor("/not/in/index") != nil {
+		t.Fatal("索引外的 dir 不应写入映射")
+	}
+}
+
+func TestAdminTokenAuth(t *testing.T) {
+	srv, _, _ := newTestServerWithToken(t, "secret-token")
+
+	// 对外端点不受影响
+	if code, _ := get(t, srv.URL+"/search?keyword="); code != 200 {
+		t.Fatalf("/search 不应需要鉴权，code = %d", code)
+	}
+	if code, _ := get(t, srv.URL+"/play?id=/anime2/K-ON!"); code != 200 {
+		t.Fatalf("/play 不应需要鉴权，code = %d", code)
+	}
+
+	// 管理端点未带口令：401
+	for _, path := range []string{"/admin", "/refresh"} {
+		if code, _ := get(t, srv.URL+path); code != http.StatusUnauthorized {
+			t.Fatalf("%s 未带口令应返回 401，实际 %d", path, code)
+		}
+	}
+
+	// Basic 密码 = token：放行
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/admin", nil)
+	req.SetBasicAuth("admin", "secret-token")
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != 200 {
+		t.Fatalf("Basic 鉴权应放行，实际 %d", res.StatusCode)
+	}
+
+	// X-Admin-Token 头：放行；错误口令：401
+	req, _ = http.NewRequest(http.MethodGet, srv.URL+"/refresh", nil)
+	req.Header.Set("X-Admin-Token", "secret-token")
+	res, _ = http.DefaultClient.Do(req)
+	res.Body.Close()
+	if res.StatusCode != 200 {
+		t.Fatalf("X-Admin-Token 应放行，实际 %d", res.StatusCode)
+	}
+	req.Header.Set("X-Admin-Token", "wrong")
+	res, _ = http.DefaultClient.Do(req)
+	res.Body.Close()
+	if res.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("错误口令应 401，实际 %d", res.StatusCode)
 	}
 }
 

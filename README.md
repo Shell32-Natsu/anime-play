@@ -77,6 +77,7 @@ docker rm -f anime-play
 | `OPENLIST_TOKEN` | ✅ | — | OpenList 管理员 token（管理页「其他设置」获取） |
 | `SCAN_ROOTS` | ✅ | — | 扫描的根路径，多个用逗号分隔，例如 `/anime,/anime2,/盘B/番剧` |
 | `LISTEN_PORT` | | `8080` | 服务监听端口 |
+| `ADMIN_TOKEN` | | （空） | `/admin`、`/refresh` 的访问口令。设置后浏览器访问会弹 Basic 认证（密码填 token，用户名任意），脚本调用可用请求头 `X-Admin-Token`。留空则管理端点不做鉴权，仅适合可信内网；`/search`、`/play` 始终无鉴权（供播放器爬取） |
 | `MAPPING_FILE` | | `/data/mapping.json` | 映射文件路径，**必须放在挂载 volume 内**，否则容器重建后映射丢失 |
 | `REFRESH_INTERVAL` | | `30m` | 目录索引自动刷新间隔（Go duration 格式） |
 | `RAWURL_CACHE_TTL` | | `1h` | 视频直链缓存 TTL，应**保守地小于** OpenList 签名有效期（S3 类驱动默认 4 小时） |
@@ -131,13 +132,15 @@ docker rm -f anime-play
 
 ### `GET /refresh` —— 手动刷新索引
 
-重新扫描所有 `SCAN_ROOTS`、重建条目索引。新增番剧后访问一次即可，平时按 `REFRESH_INTERVAL` 自动刷新。
+重新扫描所有 `SCAN_ROOTS`、重建条目索引。新增番剧后访问一次即可，平时按 `REFRESH_INTERVAL` 自动刷新。设置了 `ADMIN_TOKEN` 时此端点需要鉴权。
 
 ### `GET /admin` —— 映射管理界面
 
 - 按扫描根分组列出所有条目，标明「已映射 / 未映射」与集数
 - 直接在网页里给条目填写番剧名 + 别名（逗号分隔），保存即写入映射文件并立刻生效；留空保存 = 删除映射
 - 未映射的条目搜索时用清洗后的目录名（去字幕组 / 画质标签）兜底，但建议尽快补全映射，否则播放器用中文正式名搜索通常搜不到
+- 设置了 `ADMIN_TOKEN` 时需要鉴权（浏览器 Basic 认证密码填 token，或请求头 `X-Admin-Token`）
+- 保存接口为 `POST /admin/save`（JSON：`{"dir": "...", "names": ["..."]}`），仅接受当前索引中存在的 `dir`；若用脚本直接调用，需带请求头 `X-Requested-With: anime-play`（CSRF 防护）和 `Content-Type: application/json`
 
 ## 番剧名映射文件
 

@@ -53,9 +53,13 @@ func main() {
 	cancelScan()
 	idx.StartAutoRefresh(ctx, cfg.RefreshInterval)
 
+	if cfg.AdminToken == "" {
+		log.Printf("提示：未设置 ADMIN_TOKEN，/admin 与 /refresh 不做鉴权（仅建议在可信内网这样部署）")
+	}
+
 	srv := &http.Server{
 		Addr:              ":" + cfg.ListenPort,
-		Handler:           server.New(idx, store).Handler(),
+		Handler:           server.New(idx, store, cfg.AdminToken).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 

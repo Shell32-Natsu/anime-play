@@ -1,0 +1,14 @@
+services:
+  anime-play:
+    build: .
+    image: anime-play:latest
+    container_name: anime-play
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      # 映射文件持久化目录（mapping.json 在这里，删容器不丢）
+      - ./data:/data
+    # 全部配置写在 .env 里（cp .env.example .env 后修改），由 compose 注入容器
+    env_file:
+      - .env

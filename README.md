@@ -2,6 +2,8 @@
 
 把 OpenList 上散乱命名的本地番剧，对外**伪装成一个在线番剧播放站点**：弹幕播放器按它惯常的「在线站点」爬取流程（搜索 → 选条目 → 选集 → 取视频地址）就能播到本地视频，从而给本地番剧挂上弹幕。
 
+本项目是为配合 [Animeko](https://github.com/open-ani/animeko) 使用而写的：在 Animeko 里把本服务添加为一个自定义（Selector）数据源，即可在 Animeko 中直接搜到、播放 OpenList 上的本地番剧并自动挂载弹幕。其他支持「自定义网页源 + CSS/XPath 选择器」的播放器同样适用。
+
 特点：
 
 - 不重命名、不移动任何本地文件；不查任何外部 API
@@ -99,6 +101,15 @@ docker rm -f anime-play
 | `REFRESH_INTERVAL` | | `30m` | 目录索引自动刷新间隔（Go duration 格式） |
 | `RAWURL_CACHE_TTL` | | `1h` | 视频直链缓存 TTL，应**保守地小于** OpenList 签名有效期（S3 类驱动默认 4 小时） |
 | `ENV_FILE` | | `.env` | 要加载的 .env 文件路径（仅裸跑二进制时有意义；默认文件不存在则跳过） |
+
+## 配合 Animeko 使用
+
+在 [Animeko](https://github.com/open-ani/animeko) 的「设置 → 数据源」里添加一个**自定义数据源（Selector）**，指向本服务即可：
+
+- 站点地址 / 搜索地址：`http://<host>:8080/search?keyword=<关键词占位符>`（占位符按 Animeko 的格式填）
+- 条目、集数、视频地址的选择器按下方「HTML class 结构清单」配置：条目链接 `.anime-link`、条目标题 `.anime-title`、集数链接 `.ep-link`（文本即「第 N 话」）、视频地址 `video.player` 的 `src`
+- Animeko 用番剧的中文正式名搜索，所以请先在 `/admin` 里给条目配好番剧名映射，否则搜不到
+- 弹幕由 Animeko 自己按番剧名 + 集数去弹幕站匹配，本服务不参与
 
 ## 对外端点与 HTML class 结构清单
 

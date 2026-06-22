@@ -11,6 +11,22 @@
 
 ---
 
+## 镜像（GHCR）
+
+仓库自带 GitHub Actions 工作流（`.github/workflows/docker.yml`）：push 到 `main` 或打 `v*` 标签时，自动跑测试、构建多架构镜像（linux/amd64 + linux/arm64）并推送到 GHCR：
+
+- `ghcr.io/shell32-natsu/anime-play:latest` —— main 分支最新
+- `ghcr.io/shell32-natsu/anime-play:main-<sha>` —— 按 commit 固定版本
+- `ghcr.io/shell32-natsu/anime-play:1.2.3` / `1.2` —— 打 `v1.2.3` 标签时生成
+
+不想本地构建的话，把 `docker-compose.yml` 里的 `build: .` 换成（或直接保留 `image:` 行并删掉 `build:`）：
+
+```yaml
+    image: ghcr.io/shell32-natsu/anime-play:latest
+```
+
+Pull request 只跑测试与构建验证，不推送镜像。推送使用内置的 `GITHUB_TOKEN`，无需配置额外 secret；首次发布后如需公开拉取，到 GitHub Packages 页面把该 package 的可见性改为 public。
+
 ## 快速开始（Docker Compose，推荐）
 
 1. 准备配置文件（compose 通过 `env_file` 把 `.env` 注入容器，`.env` 已在 .gitignore 里，不会被提交）：

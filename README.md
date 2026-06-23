@@ -73,7 +73,9 @@ docker run -d --name anime-play \
 ```bash
 git clone https://github.com/Shell32-Natsu/anime-play.git && cd anime-play
 cp .env.example .env             # 编辑 .env，填上必填三项
-docker compose up -d --build     # 仓库自带的 compose 用 build: . 本地构建
+# 仓库自带的 docker-compose.yml 默认拉 GHCR 镜像；要本地构建的话，
+# 把其中的 build: . 取消注释后：
+docker compose up -d --build
 ```
 
 ### 镜像 tag 说明

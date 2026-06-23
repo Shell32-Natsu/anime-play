@@ -1,7 +1,8 @@
 services:
   anime-play:
-    build: .
-    image: anime-play:latest
+    image: ghcr.io/shell32-natsu/anime-play:latest
+    # 想本地从源码构建的话，取消下面这行注释，再用 docker compose up -d --build
+    # build: .
     container_name: anime-play
     restart: unless-stopped
     ports:

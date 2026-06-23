@@ -111,6 +111,7 @@ GitHub Actions（`.github/workflows/docker.yml`）在 push 到 `main` 或打 `v*
 | `EPISODE_MAP_FILE` | | `/data/episodes.yaml` | 手动集数映射 YAML 路径（可选，文件不存在则全部走自动解析），见下方「手动集数映射」 |
 | `REFRESH_INTERVAL` | | `30m` | 目录索引自动刷新间隔（Go duration 格式） |
 | `RAWURL_CACHE_TTL` | | `1h` | 视频直链缓存 TTL，应**保守地小于** OpenList 签名有效期（S3 类驱动默认 4 小时） |
+| `RAWURL_HOST_REWRITE` | | `auto` | 直链主机名自动替换（见下方「多入口访问」）。`auto` = 开启，`off` = 关闭 |
 | `ENV_FILE` | | `.env` | 要加载的 .env 文件路径（仅裸跑二进制时有意义；默认文件不存在则跳过） |
 
 ## 配合 Animeko 使用
@@ -226,6 +227,16 @@ entries:
 - 手动指定的文件**优先于**文件名自动解析；未列出的文件仍走自动解析；指定的文件名必须真实存在于该文件夹
 - 直接编辑文件保存后自动热重载（fsnotify + 防抖），只在内存里重建集数列表，**不会**重新请求 OpenList，也无需重启；YAML 写错时保留旧数据
 - 注意：通过网页保存会重写整个 YAML 文件，手写的注释不会保留
+
+## 多入口访问（内网 IP / Tailscale）
+
+OpenList 返回的视频直链主机名是你在 `OPENLIST_BASE_URL` 里配的那个（通常是内网 IP）。如果你有时在内网、有时通过 Tailscale 访问同一台服务器，直链里的内网 IP 在 Tailscale 下是连不上的。
+
+本服务默认开启**直链主机名自动替换**（`RAWURL_HOST_REWRITE=auto`）：渲染播放页时，凡是主机名等于 OpenList 主机名的直链，都把主机名替换成「客户端访问本服务所用的主机名」，端口保持不变——你用 `192.168.1.10:8080` 打开就得到内网直链，用 `100.x.y.z:8080`（或 ts.net 域名）打开就得到 Tailscale 直链。无需任何额外配置，也不用重启切换。
+
+- 前提：OpenList 与本服务在同一台机器（或同样能通过这两个地址访问），且端口在两个网络下一致——Tailscale 场景天然满足
+- 指向外部网盘 CDN 的直链（主机名不是 OpenList 的）不会被改动
+- 如果你的部署不满足该前提（比如 OpenList 在另一台机器、或本服务挂在反向代理域名后），设 `RAWURL_HOST_REWRITE=off` 关闭
 
 ## 为什么视频直链是「实时取」的
 

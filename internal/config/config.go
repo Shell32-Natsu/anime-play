@@ -28,6 +28,10 @@ type Config struct {
 	RefreshInterval time.Duration
 	// RawURLCacheTTL 视频直链缓存 TTL，应保守地小于 OpenList 签名有效期
 	RawURLCacheTTL time.Duration
+	// RewriteRawURLHost 播放页渲染时，把指向 OpenList 的直链主机名替换为
+	// 客户端访问本服务所用的主机名（端口不变）。用于内网 IP / Tailscale IP 等
+	// 多个入口访问同一台服务器的场景。
+	RewriteRawURLHost bool
 }
 
 // FromEnv 读取环境变量并校验必填项。
@@ -88,6 +92,15 @@ func FromEnv() (*Config, error) {
 	cfg.RawURLCacheTTL, err = parseDurationEnv("RAWURL_CACHE_TTL", time.Hour)
 	if err != nil {
 		return nil, err
+	}
+
+	switch v := strings.ToLower(os.Getenv("RAWURL_HOST_REWRITE")); v {
+	case "", "auto", "on", "true", "1":
+		cfg.RewriteRawURLHost = true
+	case "off", "false", "0":
+		cfg.RewriteRawURLHost = false
+	default:
+		return nil, fmt.Errorf("RAWURL_HOST_REWRITE 取值无效: %q（可用 auto / off）", v)
 	}
 	return cfg, nil
 }

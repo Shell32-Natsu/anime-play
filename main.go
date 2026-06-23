@@ -7,6 +7,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"syscall"
@@ -70,9 +71,20 @@ func main() {
 		log.Printf("提示：未设置 ADMIN_TOKEN，/admin 与 /refresh 不做鉴权（仅建议在可信内网这样部署）")
 	}
 
+	openlistHost := ""
+	if u, err := url.Parse(cfg.OpenListBaseURL); err == nil {
+		openlistHost = u.Hostname()
+	}
+
+	handler := server.New(idx, store, epStore, server.Options{
+		AdminToken:        cfg.AdminToken,
+		OpenListHost:      openlistHost,
+		RewriteRawURLHost: cfg.RewriteRawURLHost,
+	}).Handler()
+
 	srv := &http.Server{
 		Addr:              ":" + cfg.ListenPort,
-		Handler:           server.New(idx, store, epStore, cfg.AdminToken).Handler(),
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 

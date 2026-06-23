@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"html/template"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"sort"
@@ -37,20 +38,32 @@ type EpisodeMapStore interface {
 	SetOverrides(dir string, fileToNum map[string]float64) error
 }
 
-// Server HTTP 服务。
-type Server struct {
-	idx        *index.Index
-	mapping    *mapping.Store
-	epmap      EpisodeMapStore
-	adminToken string
-	mux        *http.ServeMux
+// Options Server 的可选配置。
+type Options struct {
+	// AdminToken 非空时，/admin、/admin/save、/admin/episodes*、/refresh 这些管理端点
+	// 需要鉴权（HTTP Basic 的密码 = token，或请求头 X-Admin-Token）；为空则不鉴权，
+	// 仅适合可信内网。对外伪站点端点（/search /play）始终无鉴权，供播放器爬取。
+	AdminToken string
+	// OpenListHost OPENLIST_BASE_URL 的主机名，用于判断直链是否指向 OpenList 本身。
+	OpenListHost string
+	// RewriteRawURLHost 为 true 时，播放页里指向 OpenList 的直链主机名会被替换成
+	// 客户端访问本服务所用的主机名（端口不变）。这样同一台服务器无论通过内网 IP
+	// 还是 Tailscale IP 访问，拿到的视频地址都是客户端实际可达的那个。
+	RewriteRawURLHost bool
 }
 
-// New 创建 Server。adminToken 非空时，/admin、/admin/save、/refresh 这些管理端点
-// 需要鉴权（HTTP Basic 的密码 = token，或请求头 X-Admin-Token）；为空则不鉴权，
-// 仅适合可信内网。对外伪站点端点（/search /play）始终无鉴权，供播放器爬取。
-func New(idx *index.Index, m *mapping.Store, em EpisodeMapStore, adminToken string) *Server {
-	s := &Server{idx: idx, mapping: m, epmap: em, adminToken: adminToken, mux: http.NewServeMux()}
+// Server HTTP 服务。
+type Server struct {
+	idx     *index.Index
+	mapping *mapping.Store
+	epmap   EpisodeMapStore
+	opts    Options
+	mux     *http.ServeMux
+}
+
+// New 创建 Server。
+func New(idx *index.Index, m *mapping.Store, em EpisodeMapStore, opts Options) *Server {
+	s := &Server{idx: idx, mapping: m, epmap: em, opts: opts, mux: http.NewServeMux()}
 	s.mux.HandleFunc("GET /search", s.handleSearch)
 	s.mux.HandleFunc("GET /play", s.handlePlay)
 	s.mux.HandleFunc("GET /refresh", s.requireAdmin(s.handleRefresh))
@@ -80,12 +93,12 @@ func requireJSONNoCSRF(w http.ResponseWriter, r *http.Request) bool {
 // requireAdmin 管理端点鉴权中间件；adminToken 为空时直接放行。
 func (s *Server) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if s.adminToken == "" {
+		if s.opts.AdminToken == "" {
 			next(w, r)
 			return
 		}
 		equal := func(got string) bool {
-			return subtle.ConstantTimeCompare([]byte(got), []byte(s.adminToken)) == 1
+			return subtle.ConstantTimeCompare([]byte(got), []byte(s.opts.AdminToken)) == 1
 		}
 		if equal(r.Header.Get("X-Admin-Token")) {
 			next(w, r)
@@ -230,11 +243,55 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 			log.Printf("[server] 取直链失败 %s: %v", ep.Path, err)
 			data["Error"] = fmt.Sprintf("获取视频直链失败: %v", err)
 		} else {
+			if s.opts.RewriteRawURLHost {
+				rawURL = rewriteRawURLHost(rawURL, r.Host, s.opts.OpenListHost)
+			}
 			data["VideoURL"] = rawURL
 		}
 	}
 
 	render(w, playTmpl, data)
+}
+
+// rewriteRawURLHost 把指向 OpenList 的直链主机名替换为客户端访问本服务所用的主机名（端口不变）。
+//
+// 场景：同一台服务器既有内网 IP 又有 Tailscale IP。OpenList 返回的直链主机名是配置里的内网地址，
+// 客户端走 Tailscale 访问时连不上；但客户端访问本服务用的主机名一定是它可达的，OpenList 又和
+// 本服务在同一台机器/同一组地址上，所以直接换成请求里的主机名即可，无需任何配置或重启。
+//
+// 只有直链主机名等于 OPENLIST_BASE_URL 的主机名时才替换（即直链经由 OpenList 本身代理/服务），
+// 指向外部网盘 CDN 的直链原样返回。
+func rewriteRawURLHost(rawURL, requestHost, openlistHost string) string {
+	if openlistHost == "" || requestHost == "" {
+		return rawURL
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Hostname() == "" {
+		return rawURL
+	}
+	if !strings.EqualFold(u.Hostname(), openlistHost) {
+		return rawURL // 外部直链（网盘 CDN 等），不动
+	}
+
+	// 取请求 Host 的主机名部分（去掉端口、IPv6 方括号）
+	reqName := requestHost
+	if h, _, err := net.SplitHostPort(requestHost); err == nil {
+		reqName = h
+	}
+	reqName = strings.Trim(reqName, "[]")
+	if reqName == "" || strings.EqualFold(reqName, u.Hostname()) {
+		return rawURL
+	}
+
+	if strings.Contains(reqName, ":") {
+		reqName = "[" + reqName + "]" // IPv6
+	}
+	if port := u.Port(); port != "" {
+		u.Host = reqName + ":" + port
+	} else {
+		u.Host = reqName
+	}
+	return u.String()
 }
 
 // ---------- /refresh ----------

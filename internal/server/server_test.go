@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"html"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -27,6 +28,9 @@ type fakeOpenList struct {
 	tree     map[string][]openlist.Item // path -> items
 	listHits atomic.Int64
 	getHits  atomic.Int64
+	// rawURLHost 非空时，fs/get 返回的直链用 http://<rawURLHost> 作为前缀
+	// （模拟直链经由 OpenList 自身代理的形态）；为空则返回外部 CDN 形态的直链。
+	rawURLHost string
 }
 
 func (f *fakeOpenList) handler() http.Handler {
@@ -63,11 +67,15 @@ func (f *fakeOpenList) handler() http.Handler {
 		}
 		body, _ := io.ReadAll(r.Body)
 		_ = json.Unmarshal(body, &req)
+		base := "https://signed.example.com"
+		if f.rawURLHost != "" {
+			base = "http://" + f.rawURLHost + "/d"
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"code": 200, "message": "success",
 			"data": map[string]any{
 				"name":    filepath.Base(req.Path),
-				"raw_url": "https://signed.example.com" + req.Path + "?sign=abc123",
+				"raw_url": base + req.Path + "?sign=abc123",
 			},
 		})
 	})
@@ -130,7 +138,7 @@ func newTestServerWithToken(t *testing.T, adminToken string) (*httptest.Server, 
 	}
 	t.Cleanup(store.Close)
 
-	srv := httptest.NewServer(New(idx, store, epStore, adminToken).Handler())
+	srv := httptest.NewServer(New(idx, store, epStore, Options{AdminToken: adminToken}).Handler())
 	t.Cleanup(srv.Close)
 	return srv, fake, store, epStore
 }
@@ -406,7 +414,7 @@ func TestManualEpisodeOverrides(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(store.Close)
-	srv := httptest.NewServer(New(idx, store, epStore, "").Handler())
+	srv := httptest.NewServer(New(idx, store, epStore, Options{}).Handler())
 	t.Cleanup(srv.Close)
 
 	_, body := get(t, srv.URL+"/play?id=/anime/Bocchi")
@@ -511,6 +519,137 @@ func TestAdminEpisodesPageAndSave(t *testing.T) {
 	_, body = get(t, srv.URL+"/play?id="+url.QueryEscape(bocchiID))
 	if !strings.Contains(body, "SP Menu.mp4</a>") {
 		t.Fatalf("清空手动映射后应回到自动解析:\n%s", body)
+	}
+}
+
+func TestRewriteRawURLHost(t *testing.T) {
+	cases := []struct {
+		name         string
+		rawURL       string
+		requestHost  string
+		openlistHost string
+		want         string
+	}{
+		{
+			name:         "内网地址换成 Tailscale 地址，端口保留",
+			rawURL:       "http://192.168.1.10:5244/d/anime/ep01.mkv?sign=abc",
+			requestHost:  "100.64.0.5:8080",
+			openlistHost: "192.168.1.10",
+			want:         "http://100.64.0.5:5244/d/anime/ep01.mkv?sign=abc",
+		},
+		{
+			name:         "外部网盘 CDN 直链不动",
+			rawURL:       "https://cdn.example.com/file?sign=abc",
+			requestHost:  "100.64.0.5:8080",
+			openlistHost: "192.168.1.10",
+			want:         "https://cdn.example.com/file?sign=abc",
+		},
+		{
+			name:         "请求主机名与直链相同则不动",
+			rawURL:       "http://192.168.1.10:5244/d/x.mkv",
+			requestHost:  "192.168.1.10:8080",
+			openlistHost: "192.168.1.10",
+			want:         "http://192.168.1.10:5244/d/x.mkv",
+		},
+		{
+			name:         "用域名访问也替换",
+			rawURL:       "http://192.168.1.10:5244/d/x.mkv",
+			requestHost:  "nas.tailnet-xxxx.ts.net:8080",
+			openlistHost: "192.168.1.10",
+			want:         "http://nas.tailnet-xxxx.ts.net:5244/d/x.mkv",
+		},
+		{
+			name:         "直链无端口时只换主机名",
+			rawURL:       "http://192.168.1.10/d/x.mkv",
+			requestHost:  "100.64.0.5:8080",
+			openlistHost: "192.168.1.10",
+			want:         "http://100.64.0.5/d/x.mkv",
+		},
+		{
+			name:         "IPv6 请求主机名加方括号",
+			rawURL:       "http://192.168.1.10:5244/d/x.mkv",
+			requestHost:  "[fd7a::1234]:8080",
+			openlistHost: "192.168.1.10",
+			want:         "http://[fd7a::1234]:5244/d/x.mkv",
+		},
+	}
+	for _, c := range cases {
+		if got := rewriteRawURLHost(c.rawURL, c.requestHost, c.openlistHost); got != c.want {
+			t.Errorf("%s: rewriteRawURLHost = %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+func TestPlayPageRewritesRawURLHost(t *testing.T) {
+	fake := &fakeOpenList{
+		t: t,
+		tree: map[string][]openlist.Item{
+			"/anime":        {dir("Bocchi")},
+			"/anime/Bocchi": {file("Bocchi - 01.mkv")},
+		},
+	}
+	upstream := httptest.NewServer(fake.handler())
+	t.Cleanup(upstream.Close)
+	upstreamHost := strings.TrimPrefix(upstream.URL, "http://") // 127.0.0.1:port
+	upstreamName, upstreamPort, _ := net.SplitHostPort(upstreamHost)
+
+	client := openlist.New(upstream.URL, "test-token")
+	idx := index.New(client, []string{"/anime"}, time.Hour, nil)
+	if err := idx.Scan(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	store, err := mapping.NewStore(filepath.Join(t.TempDir(), "mapping.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(store.Close)
+
+	srv := httptest.NewServer(New(idx, store, nil, Options{
+		OpenListHost:      upstreamName,
+		RewriteRawURLHost: true,
+	}).Handler())
+	t.Cleanup(srv.Close)
+
+	// 模拟客户端通过 Tailscale 主机名访问本服务（Host 头不同于 OpenList 配置的主机名）
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/play?id=/anime/Bocchi&ep=1", nil)
+	req.Host = "100.64.0.5:8080"
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(res.Body)
+	res.Body.Close()
+
+	want := `<video class="player" src="https://signed.example.com/anime/Bocchi/Bocchi%20-%2001.mkv?sign=abc123"`
+	_ = want // fake 返回的直链主机是 signed.example.com（外部 CDN 形态），不应被改写
+	if !strings.Contains(string(body), `src="https://signed.example.com`) {
+		t.Fatalf("外部直链不应被改写:\n%s", body)
+	}
+
+	// 让 fake 返回「指向 OpenList 自身」的直链（主机名 = OpenList 主机名），应被改写为请求 Host 的主机名
+	fake.rawURLHost = upstreamName + ":" + upstreamPort
+	idx2 := index.New(client, []string{"/anime"}, time.Hour, nil)
+	if err := idx2.Scan(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	srv2 := httptest.NewServer(New(idx2, store, nil, Options{
+		OpenListHost:      upstreamName,
+		RewriteRawURLHost: true,
+	}).Handler())
+	t.Cleanup(srv2.Close)
+
+	req, _ = http.NewRequest(http.MethodGet, srv2.URL+"/play?id=/anime/Bocchi&ep=1", nil)
+	req.Host = "100.64.0.5:8080"
+	res, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = io.ReadAll(res.Body)
+	res.Body.Close()
+
+	wantPrefix := `src="http://100.64.0.5:` + upstreamPort + `/`
+	if !strings.Contains(string(body), wantPrefix) {
+		t.Fatalf("指向 OpenList 的直链应改写为请求主机名（期望包含 %q）:\n%s", wantPrefix, body)
 	}
 }
 

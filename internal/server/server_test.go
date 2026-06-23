@@ -572,6 +572,27 @@ func TestRewriteRawURLHost(t *testing.T) {
 			openlistHost: "192.168.1.10",
 			want:         "http://[fd7a::1234]:5244/d/x.mkv",
 		},
+		{
+			name:         "Host 头注入路径：保持原样",
+			rawURL:       "http://192.168.1.10:5244/d/x.mkv",
+			requestHost:  "evil.com/steal?x=",
+			openlistHost: "192.168.1.10",
+			want:         "http://192.168.1.10:5244/d/x.mkv",
+		},
+		{
+			name:         "Host 头注入引号/空格：保持原样",
+			rawURL:       "http://192.168.1.10:5244/d/x.mkv",
+			requestHost:  `a" onerror="alert(1)`,
+			openlistHost: "192.168.1.10",
+			want:         "http://192.168.1.10:5244/d/x.mkv",
+		},
+		{
+			name:         "Host 头注入 userinfo@：保持原样",
+			rawURL:       "http://192.168.1.10:5244/d/x.mkv",
+			requestHost:  "user@evil.com:8080",
+			openlistHost: "192.168.1.10",
+			want:         "http://192.168.1.10:5244/d/x.mkv",
+		},
 	}
 	for _, c := range cases {
 		if got := rewriteRawURLHost(c.rawURL, c.requestHost, c.openlistHost); got != c.want {

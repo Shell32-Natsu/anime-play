@@ -20,6 +20,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -282,6 +283,11 @@ func rewriteRawURLHost(rawURL, requestHost, openlistHost string) string {
 	if reqName == "" || strings.EqualFold(reqName, u.Hostname()) {
 		return rawURL
 	}
+	// Host 头是客户端可控输入，只接受语法合法的主机名 / IP，
+	// 防止把路径、引号等内容注入到生成的 URL 里
+	if !isValidHostname(reqName) {
+		return rawURL
+	}
 
 	if strings.Contains(reqName, ":") {
 		reqName = "[" + reqName + "]" // IPv6
@@ -292,6 +298,20 @@ func rewriteRawURLHost(rawURL, requestHost, openlistHost string) string {
 		u.Host = reqName
 	}
 	return u.String()
+}
+
+// reHostname RFC 1123 风格的主机名 / IPv4：字母数字、点、连字符。
+var reHostname = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9.-]{0,252}[a-zA-Z0-9])?$`)
+
+// isValidHostname 判断 s 是否是合法的主机名 / IPv4 / IPv6 字面量（不含端口、方括号）。
+func isValidHostname(s string) bool {
+	if s == "" || len(s) > 253 {
+		return false
+	}
+	if strings.Contains(s, ":") {
+		return net.ParseIP(s) != nil // IPv6 必须是合法 IP 字面量
+	}
+	return reHostname.MatchString(s)
 }
 
 // ---------- /refresh ----------
